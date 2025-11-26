@@ -2,6 +2,7 @@ import socket
 import select
 import logger
 import filter
+import cache
 
 def parse_request(request_data):
     try:
@@ -26,10 +27,11 @@ def parse_request(request_data):
             port_pos = base_url.find(":")
             if port_pos == -1: host, port = base_url, 80
             else: host, port = base_url[:port_pos], int(base_url[port_pos+1:])
-        return method, host, port
-    except: return None, None, None
+        return method, host, port, url
+    except: return None, None, None, None
 
 def handle_https_tunnel(client_socket, target_host, target_port):
+    # https doesn't get cached
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.connect((target_host, target_port))
@@ -50,18 +52,43 @@ def handle_https_tunnel(client_socket, target_host, target_port):
         server_socket.close()
         client_socket.close()
 
-def handle_http_request(client_socket, request_data, target_host, target_port):
+def handle_http_request(client_socket, request_data, target_host, target_port, full_url):
+    """
+    UPDATED: Supports Caching
+    """
     try:
+        # 1. CHECK CACHE FIRST
+        cached_response = cache.get_cache(full_url)
+        if cached_response:
+            print(f"[*] Cache Hit! Serving from memory: {full_url}")
+            client_socket.sendall(cached_response)
+            client_socket.close()
+            return
+
+        # 2. IF NOT IN CACHE, DOWNLOAD FROM SERVER
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.connect((target_host, target_port))
         server_socket.sendall(request_data)
+        
+        full_response = b""
+        
         while True:
             data = server_socket.recv(4096)
-            if len(data) > 0: client_socket.sendall(data)
-            else: break
+            if len(data) > 0:
+                client_socket.sendall(data)
+                full_response += data
+            else:
+                break
+        
+        # 3. SAVE TO CACHE
+        cache.save_cache(full_url, full_response)
+        
         server_socket.close()
         client_socket.close()
-    except: client_socket.close()
+        
+    except Exception as e:
+        print(f"[!] HTTP Error: {e}")
+        client_socket.close()
 
 def send_forbidden_response(client_socket):
     response = (
@@ -80,14 +107,13 @@ def handle_request(client_socket, client_address):
             client_socket.close()
             return
 
-        method, target_host, target_port = parse_request(request_data)
+        method, target_host, target_port, full_url = parse_request(request_data)
         client_ip = client_address[0]
         
         if not target_host:
             client_socket.close()
             return
 
-        # --- 1. FILTER CHECK ---
         if filter.is_blocked(target_host):
             print(f"[!] BLOCKED: {target_host}")
             logger.log_request(client_ip, method, target_host, "BLOCKED")
@@ -100,7 +126,7 @@ def handle_request(client_socket, client_address):
         if method == 'CONNECT':
             handle_https_tunnel(client_socket, target_host, target_port)
         else:
-            handle_http_request(client_socket, request_data, target_host, target_port)
+            handle_http_request(client_socket, request_data, target_host, target_port, full_url)
 
     except Exception as e:
         print(f"[!] General Handler Error: {e}")
