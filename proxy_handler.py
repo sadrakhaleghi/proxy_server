@@ -31,16 +31,22 @@ def parse_request(request_data):
         return method, host, port, url
     except: return None, None, None, None
 
+def send_forbidden_response(client_socket):
+    response = (b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                b"<html><body><h1>403 Forbidden</h1></body></html>")
+    client_socket.sendall(response)
+    client_socket.close()
+
+def send_too_many_requests_response(client_socket):
+    response = (b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                b"<html><body><h1>429 Too Many Requests</h1></body></html>")
+    client_socket.sendall(response)
+    client_socket.close()
+
 def send_stats_page(client_socket):
-    """
-    Sends the statistics HTML page to the client.
-    """
     response_body = stats.get_stats_html()
     response_headers = (
-        "HTTP/1.1 200 OK\r\n"
-        f"Content-Length: {len(response_body)}\r\n"
-        "Content-Type: text/html\r\n"
-        "Connection: close\r\n\r\n"
+        f"HTTP/1.1 200 OK\r\nContent-Length: {len(response_body)}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
     ).encode('utf-8')
     client_socket.sendall(response_headers + response_body)
     client_socket.close()
@@ -59,9 +65,7 @@ def handle_https_tunnel(client_socket, target_host, target_port):
                 try:
                     data = sock.recv(4096)
                     if not data: return
-                    
                     stats.add_bytes(len(data))
-
                     other_sock.sendall(data)
                 except: return
     except: pass
@@ -69,60 +73,71 @@ def handle_https_tunnel(client_socket, target_host, target_port):
         server_socket.close()
         client_socket.close()
 
+def extract_header(response_bytes, header_name):
+    try:
+        headers_end = response_bytes.find(b"\r\n\r\n")
+        if headers_end == -1: return None
+        headers_part = response_bytes[:headers_end].decode('utf-8', errors='ignore')
+        for line in headers_part.split('\r\n'):
+            if line.lower().startswith(header_name.lower() + ":"):
+                return line.split(":", 1)[1].strip()
+    except: pass
+    return None
+
 def handle_http_request(client_socket, request_data, target_host, target_port, full_url):
     try:
-        # 1. CHECK CACHE
-        cached_response = cache.get_cache(full_url)
-        if cached_response:
-            print(f"[*] Cache Hit! {full_url}")
+        cached_data, last_modified = cache.get_cache(full_url)
+        
+        if cached_data and not last_modified:
+            print(f"[*] Cache Hit (Fresh)! {full_url}")
             stats.increment_cache()
-            client_socket.sendall(cached_response)
+            client_socket.sendall(cached_data)
             client_socket.close()
             return
 
-        # 2. DOWNLOAD
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.connect((target_host, target_port))
+
+        if last_modified:
+            print(f"[?] Conditional Request for {full_url} (Since: {last_modified})")
+            if request_data.endswith(b"\r\n\r\n"):
+                insert_header = f"If-Modified-Since: {last_modified}\r\n\r\n"
+                request_data = request_data[:-4] + insert_header.encode('utf-8')
+
         server_socket.sendall(request_data)
         
         full_response = b""
+        first_chunk = True
+        is_304 = False
         
         while True:
             data = server_socket.recv(4096)
-            if len(data) > 0:
-                stats.add_bytes(len(data))
-                client_socket.sendall(data)
-                full_response += data
-            else:
-                break
+            if not data: break
+            
+            if first_chunk:
+                first_chunk = False
+                if b"304 Not Modified" in data:
+                    print(f"[*] 304 Not Modified! Serving from Old Cache.")
+                    is_304 = True
+                    cache.save_cache(full_url, cached_data, last_modified) 
+                    client_socket.sendall(cached_data)
+                    stats.increment_cache()
+                    break 
+            
+            client_socket.sendall(data)
+            full_response += data
+            stats.add_bytes(len(data))
         
-        cache.save_cache(full_url, full_response)
+        if not is_304:
+            new_last_modified = extract_header(full_response, "Last-Modified")
+            cache.save_cache(full_url, full_response, new_last_modified)
+            
         server_socket.close()
         client_socket.close()
         
     except Exception as e:
         print(f"[!] HTTP Error: {e}")
         client_socket.close()
-
-def send_forbidden_response(client_socket):
-    response = (
-        "HTTP/1.1 403 Forbidden\r\n"
-        "Content-Type: text/html\r\n"
-        "Connection: close\r\n\r\n"
-        "<html><body><h1>403 Forbidden</h1><p>Access to this site is blocked.</p></body></html>"
-    ).encode('utf-8')
-    client_socket.sendall(response)
-    client_socket.close()
-
-def send_too_many_requests_response(client_socket):
-    response = (
-        "HTTP/1.1 429 Too Many Requests\r\n"
-        "Content-Type: text/html\r\n"
-        "Connection: close\r\n\r\n"
-        "<html><body><h1>429 Too Many Requests</h1><p>You are sending requests too fast. Please slow down.</p></body></html>"
-    ).encode('utf-8')
-    client_socket.sendall(response)
-    client_socket.close()
 
 def handle_request(client_socket, client_address):
     try:
@@ -139,8 +154,9 @@ def handle_request(client_socket, client_address):
         
         client_ip = client_address[0]
 
+        # Rate Limit Check
         if stats.is_rate_limited(client_ip):
-            print(f"[!] RATE LIMIT EXCEEDED: {client_ip}")
+            print(f"[!] RATE LIMIT: {client_ip}")
             logger.log_request(client_ip, method, target_host, "RATE_LIMITED")
             send_too_many_requests_response(client_socket)
             return
@@ -148,10 +164,9 @@ def handle_request(client_socket, client_address):
         stats.increment_total()
 
         if "proxy.stats" in target_host:
-            print("[*] Serving Statistics Page")
             send_stats_page(client_socket)
             return
-        
+
         if filter.is_blocked(target_host):
             print(f"[!] BLOCKED: {target_host}")
             stats.increment_blocked()
