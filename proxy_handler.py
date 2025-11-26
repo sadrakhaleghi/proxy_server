@@ -114,6 +114,16 @@ def send_forbidden_response(client_socket):
     client_socket.sendall(response)
     client_socket.close()
 
+def send_too_many_requests_response(client_socket):
+    response = (
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><h1>429 Too Many Requests</h1><p>You are sending requests too fast. Please slow down.</p></body></html>"
+    ).encode('utf-8')
+    client_socket.sendall(response)
+    client_socket.close()
+
 def handle_request(client_socket, client_address):
     try:
         request_data = client_socket.recv(4096)
@@ -127,16 +137,21 @@ def handle_request(client_socket, client_address):
             client_socket.close()
             return
         
+        client_ip = client_address[0]
+
+        if stats.is_rate_limited(client_ip):
+            print(f"[!] RATE LIMIT EXCEEDED: {client_ip}")
+            logger.log_request(client_ip, method, target_host, "RATE_LIMITED")
+            send_too_many_requests_response(client_socket)
+            return
+        
         stats.increment_total()
 
-        # --- STATS PAGE CHECK ---
         if "proxy.stats" in target_host:
             print("[*] Serving Statistics Page")
             send_stats_page(client_socket)
             return
-
-        client_ip = client_address[0]
-
+        
         if filter.is_blocked(target_host):
             print(f"[!] BLOCKED: {target_host}")
             stats.increment_blocked()

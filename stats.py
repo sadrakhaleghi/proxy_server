@@ -61,3 +61,30 @@ def get_stats_html():
     </html>
     """
     return html.encode('utf-8')
+
+
+import time
+
+RATE_LIMIT_COUNT = 5
+RATE_LIMIT_WINDOW = 60
+
+CLIENT_HISTORY = {}
+
+def is_rate_limited(client_ip):
+    current_time = time.time()
+    
+    if client_ip not in CLIENT_HISTORY:
+        CLIENT_HISTORY[client_ip] = []
+    
+    timestamps = CLIENT_HISTORY[client_ip]
+    
+    valid_timestamps = [t for t in timestamps if current_time - t < RATE_LIMIT_WINDOW]
+    
+    valid_timestamps.append(current_time)
+    
+    CLIENT_HISTORY[client_ip] = valid_timestamps
+    
+    if len(valid_timestamps) > RATE_LIMIT_COUNT:
+        return True 
+    
+    return False
