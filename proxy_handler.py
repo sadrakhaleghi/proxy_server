@@ -1,6 +1,7 @@
 import socket
 import select
 import logger
+import filter
 
 def parse_request(request_data):
     try:
@@ -62,10 +63,17 @@ def handle_http_request(client_socket, request_data, target_host, target_port):
         client_socket.close()
     except: client_socket.close()
 
+def send_forbidden_response(client_socket):
+    response = (
+        "HTTP/1.1 403 Forbidden\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><h1>403 Forbidden</h1><p>Access to this site is blocked by Proxy.</p></body></html>"
+    ).encode('utf-8')
+    client_socket.sendall(response)
+    client_socket.close()
+
 def handle_request(client_socket, client_address):
-    """
-    UPDATED: Now logs requests to file using logger module
-    """
     try:
         request_data = client_socket.recv(4096)
         if not request_data:
@@ -73,14 +81,20 @@ def handle_request(client_socket, client_address):
             return
 
         method, target_host, target_port = parse_request(request_data)
+        client_ip = client_address[0]
         
         if not target_host:
             client_socket.close()
             return
 
-        # --- LOGGING ADDED HERE ---
+        # --- 1. FILTER CHECK ---
+        if filter.is_blocked(target_host):
+            print(f"[!] BLOCKED: {target_host}")
+            logger.log_request(client_ip, method, target_host, "BLOCKED")
+            send_forbidden_response(client_socket)
+            return
+
         print(f"[>] {method} {target_host}:{target_port}")
-        client_ip = client_address[0]
         logger.log_request(client_ip, method, target_host, "Processing")
 
         if method == 'CONNECT':
