@@ -65,7 +65,7 @@ def get_stats_html():
 
 import time
 
-RATE_LIMIT_COUNT = 5
+RATE_LIMIT_COUNT = 500
 RATE_LIMIT_WINDOW = 60
 
 CLIENT_HISTORY = {}
